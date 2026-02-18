@@ -131,19 +131,155 @@ TS_HOSTNAME=livesync
 ### `--profile cloudflare` — Cloudflare Tunnel
 
 **Requires**:
-- [Cloudflare account](https://www.cloudflare.com/) with a domain on Cloudflare DNS
-- Tunnel token from Zero Trust → Networks → Tunnels → Create tunnel
+- Free [Cloudflare account](https://www.cloudflare.com/)
+- A domain managed by Cloudflare DNS (can transfer existing domain for free)
+- Cloudflare Zero Trust account (free)
 
-**Set in `.env`**:
-```
-CF_TUNNEL_TOKEN=eyJhI...
-COUCHDB_DOMAIN=couchdb.yourdomain.com
+#### Step 1: Create a Cloudflare Tunnel
+
+1. Log in to [Cloudflare Zero Trust](https://one.dash.cloudflare.com/)
+2. Navigate to **Networks → Tunnels**
+3. Click **Create a tunnel**
+4. Choose **Cloudflared** as tunnel type
+5. Name your tunnel (e.g., `obsidian-livesync`)
+6. Click **Save tunnel**
+7. **Copy the tunnel token** — it looks like `eyJhIjoiZX...` (very long, ~400 characters)
+
+#### Step 2: Configure Environment
+
+Edit `docker/.env`:
+```env
+CF_TUNNEL_TOKEN=eyJhIjoiZX...   # Paste the full token from Step 1
+COUCHDB_DOMAIN=sync.yourdomain.com   # Must be a domain managed by Cloudflare
 ```
 
-> ⚠️ **Known issue**: Cloudflare has a 100s proxy timeout that interrupts CouchDB's  
-> long-polling replication feed, causing `524` errors.  
-> **Fix**: In the Obsidian plugin settings enable:  
-> `"Use Request API to avoid inevitable CORS problem"`
+#### Step 3: Add Public Hostname Route
+
+🚨 **CRITICAL**: Token-based tunnels ignore the local `cloudflared.yml` config file. All routing is controlled from the dashboard.
+
+Back in the Zero Trust dashboard, **in the same tunnel creation flow** (or edit your tunnel later):
+
+1. Go to the **Public Hostname** tab
+2. Click **Add a public hostname**
+3. Configure:
+   - **Subdomain**: `sync` (or your preferred subdomain)
+   - **Domain**: Select your Cloudflare domain from dropdown
+   - **Type**: `HTTP`
+   - **URL**: `couchdb:5984` ← **Do NOT use `localhost`!**
+
+**Why `couchdb:5984` not `localhost:5984`?**
+- The `cloudflared` container runs inside Docker on the same network as `couchdb`
+- Docker's internal DNS resolves `couchdb` to the correct container
+- Using `localhost` would look inside the `cloudflared` container (nothing there)
+
+4. Under **Additional application settings** (expand):
+   - **No TLS Verify**: Leave **OFF** (CouchDB uses plain HTTP internally, that's fine)
+   - Leave other settings at defaults
+5. Click **Save hostname**
+
+#### Step 4: Start the Stack
+
+```bash
+cd docker/
+docker compose --profile cloudflare up -d
+```
+
+Verify containers are running:
+```bash
+docker ps --filter "name=livesync"
+```
+
+You should see:
+- `livesync-couchdb` — Status: Up (healthy)
+- `livesync-cloudflared` — Status: Up
+- `livesync-init` — Status: Exited (0)
+
+#### Step 5: Test the Connection
+
+```bash
+# Should return 401 Unauthorized (proves CouchDB auth is working)
+curl -I https://sync.yourdomain.com
+
+# Should return {"couchdb":"Welcome",...}
+curl -u admin:yourpassword https://sync.yourdomain.com
+```
+
+If you get **404**, see Troubleshooting below.
+
+#### Step 6: Configure Obsidian Plugin
+
+In Obsidian → Settings → **Self-hosted LiveSync**:
+
+| Field | Value |
+|---|---|
+| URI | `https://sync.yourdomain.com` |
+| Username | value of `COUCHDB_USER` from `.env` |
+| Password | value of `COUCHDB_PASSWORD` from `.env` |
+| Database name | value of `COUCHDB_DATABASE` from `.env` (default: `obsidiannotes`) |
+| End-to-end passphrase | *Choose your own* — never stored server-side |
+
+Under **Remote Database Configuration → Advanced**:
+- Enable: ✅ **Use Request API to avoid inevitable CORS problem**
+  (See "Known Issue" below for why this is critical)
+
+---
+
+#### 🔧 Troubleshooting Cloudflare Tunnel
+
+**Problem: 404 Error / Cloud flare Generic Error Page**
+
+**Diagnosis**:
+```bash
+# Check if cloudflared is running
+docker logs livesync-cloudflared --tail 20
+
+# Look for: "Registered tunnel connection"
+# If you see the connector ID, the tunnel is connected but routing is wrong
+```
+
+**Fix**: The public hostname rule is missing or incorrect.
+
+1. Go to Zero Trust → Networks → Tunnels → your tunnel → **Edit**
+2. Click **Public Hostname** tab
+3. Verify a hostname exists with:
+   - Service Type: `HTTP`
+   - URL: `couchdb:5984` (NOT `localhost:5984`)
+4. If no hostname exists, add it (see Step 3 above)
+5. Wait 30 seconds for changes to propagate, then test again
+
+**Problem: Connection immediately closes / 502 Bad Gateway**
+
+**Diagnosis**: CouchDB is not healthy or not on the same Docker network as cloudflared.
+
+```bash
+docker ps --filter "name=livesync-couchdb"
+# Status should be: Up (healthy)
+
+docker inspect livesync-couchdb -f '{{.NetworkSettings.Networks}}'
+# Should show: livesync-net
+
+docker inspect livesync-cloudflared -f '{{.NetworkSettings.Networks}}'
+# Should also show: livesync-net
+```
+
+**Fix**: If CouchDB is unhealthy, check logs:
+```bash
+docker logs livesync-couchdb --tail 50
+```
+
+**Problem: 524 Timeout Errors During Sync**
+
+**Root cause**: Cloudflare's proxy has a **100-second idle timeout**. CouchDB's replication protocol uses long-polling on the `_changes` feed, which can idle for longer during quiet periods.
+
+**Fix**: Switch to short-polling mode in the Obsidian plugin:
+1. Obsidian → Settings → Self-hosted LiveSync
+2. **Remote Database Configuration → Advanced**
+3. Enable: ✅ **Use Request API to avoid inevitable CORS problem**
+4. Save and restart sync
+
+This keeps all requests under 100 seconds.
+
+**Alternative**: Use Tailscale or Caddy profiles instead — neither has aggressive timeouts.
 
 ---
 
